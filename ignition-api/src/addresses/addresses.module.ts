@@ -5,6 +5,10 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { JwtAuthGuard } from '../users/guards/jwt-auth.guard';
 import { AddressesController } from './addresses.controller';
 import { AddressesService } from './addresses.service';
+import { AddressesController } from './addresses.controller';
+import { AddressesService } from './addresses.service';
+import { PrismaModule } from '../prisma/prisma.module';
+import { JwtAuthGuard } from '../users/guards/jwt-auth.guard';
 
 @Module({
   imports: [
