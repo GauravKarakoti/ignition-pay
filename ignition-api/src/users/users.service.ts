@@ -4,18 +4,50 @@ import {
   BadRequestException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
-import { UpdateUserDto } from './dto/update-user.dto';
-import { UserProfileDto, PublicUserProfileDto } from './dto/user-profile.dto';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { Prisma, UserRole } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
+import { randomBytes, createHash } from 'crypto';
+
+import { PrismaService } from '../prisma/prisma.service';
 import { LoginResponseDto } from './dto/login.dto';
-import { UserRole } from '@prisma/client';
+import { PasswordActionResponseDto } from './dto/password.dto';
 import { RegisterResponseDto } from './dto/register-response.dto';
 import { SessionService } from '../session/session.service';
+import { UpdateUserDto } from './dto/update-user.dto';
+import { UserProfileDto, PublicUserProfileDto } from './dto/user-profile.dto';
+import { assertStrongPassword } from './password-policy';
 
-import { randomBytes, createHash } from 'crypto';
+interface PasswordSetupInput {
+  userId?: string;
+  walletAddress?: string;
+  password: string;
+}
+
+interface PasswordChangeInput {
+  userId?: string;
+  walletAddress?: string;
+  currentPassword: string;
+  newPassword: string;
+}
+
+interface PasswordUser {
+  id: string;
+  walletAddress: string | null;
+  email: string | null;
+  displayName: string | null;
+  name: string | null;
+  passwordHash: string | null;
+}
+
+const PASSWORD_HISTORY_LIMIT = 5;
+const userProfileInclude = {
+  campaigns: {
+    where: { status: 'ACTIVE' },
+  },
+  donations: true,
+} satisfies Prisma.UserInclude;
 
 @Injectable()
 export class UsersService {
@@ -30,21 +62,23 @@ export class UsersService {
    * Get authenticated user's full profile
    */
   async getMyProfile(walletAddress: string): Promise<UserProfileDto> {
-    const user = await this.prisma.user.findUnique({
-      where: { walletAddress },
+    const user = await this.prisma.user.findFirst({
+      where: { walletAddress, deletedAt: null },
       include: {
         campaigns: {
           where: { status: 'ACTIVE' },
         },
         donations: true,
       },
+    const user = await this.prisma.user.findUnique({
+      where: { walletAddress },
+      include: userProfileInclude,
     });
 
     if (!user) {
       throw new NotFoundException('User not found');
     }
 
-    // Calculate stats
     const totalRaised = user.campaigns.reduce(
       (sum, campaign) => sum + parseFloat(campaign.raisedAmount.toString()),
       0,
@@ -57,15 +91,18 @@ export class UsersService {
 
     return {
       id: user.id,
-      walletAddress: user.walletAddress || '',
+      email: user.email,
       displayName: user.displayName || undefined,
+      name: user.name || undefined,
+      phone: user.phone || undefined,
       bio: user.bio || undefined,
       avatarUrl: user.avatarUrl || undefined,
       role: user.role,
       kycStatus: user.kycStatus,
-      verifiedStatus: user.kycStatus === 'VERIFIED',
+      emailVerifiedAt: user.emailVerifiedAt || undefined,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
+      deletedAt: user.deletedAt || undefined,
       totalRaised,
       totalDonated,
       campaignCount: user.campaigns.length,
@@ -79,15 +116,14 @@ export class UsersService {
     walletAddress: string,
     updateDto: UpdateUserDto,
   ): Promise<UserProfileDto> {
-    const user = await this.prisma.user.findUnique({
-      where: { walletAddress },
+    const user = await this.prisma.user.findFirst({
+      where: { walletAddress, deletedAt: null },
     });
 
     if (!user) {
       throw new NotFoundException('User not found');
     }
 
-    // If email is being changed, ensure it's not already in use
     if (updateDto.email && updateDto.email !== user.email) {
       const existing = await this.prisma.user.findUnique({
         where: { email: updateDto.email },
@@ -97,34 +133,39 @@ export class UsersService {
       }
     }
 
-    // Parse preferences JSON if provided
-    let parsedPreferences = user.preferences;
+    const updateData: Prisma.UserUpdateInput = {
+      email: updateDto.email ?? user.email,
+      name: updateDto.name ?? user.name,
+      phone: updateDto.phone ?? user.phone,
+      displayName: updateDto.displayName ?? user.displayName,
+      bio: updateDto.bio ?? user.bio,
+      avatarUrl: updateDto.avatarUrl ?? user.avatarUrl,
+    };
+
     if (updateDto.preferences) {
       try {
-        parsedPreferences = JSON.parse(updateDto.preferences);
+        updateData.preferences = JSON.parse(
+          updateDto.preferences,
+        ) as Prisma.InputJsonValue;
       } catch {
         throw new BadRequestException('Invalid preferences JSON');
       }
     }
 
+    if (updateDto.socialLinks) {
+      try {
+        updateData.socialLinks = JSON.parse(
+          updateDto.socialLinks,
+        ) as Prisma.InputJsonValue;
+      } catch {
+        throw new BadRequestException('Invalid socialLinks JSON');
+      }
+    }
+
     const updated = await this.prisma.user.update({
       where: { id: user.id },
-      data: {
-        email: updateDto.email ?? user.email,
-        name: updateDto.name ?? user.name,
-        phone: updateDto.phone ?? user.phone,
-        preferences: parsedPreferences,
-        displayName: updateDto.displayName ?? user.displayName,
-        bio: updateDto.bio ?? user.bio,
-        avatarUrl: updateDto.avatarUrl ?? user.avatarUrl,
-        socialLinks: (updateDto.socialLinks ?? user.socialLinks) as any,
-      },
-      include: {
-        campaigns: {
-          where: { status: 'ACTIVE' },
-        },
-        donations: true,
-      },
+      data: updateData,
+      include: userProfileInclude,
     });
 
     const totalRaised = updated.campaigns.reduce(
@@ -139,15 +180,18 @@ export class UsersService {
 
     return {
       id: updated.id,
-      walletAddress: updated.walletAddress || '',
+      email: updated.email,
       displayName: updated.displayName || undefined,
+      name: updated.name || undefined,
+      phone: updated.phone || undefined,
       bio: updated.bio || undefined,
       avatarUrl: updated.avatarUrl || undefined,
       role: updated.role,
       kycStatus: updated.kycStatus,
-      verifiedStatus: updated.kycStatus === 'VERIFIED',
+      emailVerifiedAt: updated.emailVerifiedAt || undefined,
       createdAt: updated.createdAt,
       updatedAt: updated.updatedAt,
+      deletedAt: updated.deletedAt || undefined,
       totalRaised,
       totalDonated,
       campaignCount: updated.campaigns.length,
@@ -160,8 +204,8 @@ export class UsersService {
   async getPublicProfile(
     walletAddress: string,
   ): Promise<PublicUserProfileDto> {
-    const user = await this.prisma.user.findUnique({
-      where: { walletAddress },
+    const user = await this.prisma.user.findFirst({
+      where: { walletAddress, deletedAt: null },
       include: {
         campaigns: {
           where: { status: 'ACTIVE' },
@@ -198,8 +242,8 @@ export class UsersService {
     status: 'VERIFIED' | 'REJECTED' | 'PENDING',
     adminId: string,
   ): Promise<{ success: boolean; message: string }> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
+    const user = await this.prisma.user.findFirst({
+      where: { id: userId, deletedAt: null },
     });
 
     if (!user) {
@@ -241,7 +285,9 @@ export class UsersService {
       900,
     );
 
-    const user = await this.prisma.user.findUnique({ where: { email } });
+    const user = await this.prisma.user.findFirst({
+      where: { email, deletedAt: null },
+    });
 
     if (!user) {
       throw new UnauthorizedException('Invalid credentials');
@@ -321,13 +367,81 @@ export class UsersService {
     return { accessToken, refreshToken, tokenType: 'Bearer' };
   }
 
-  private hashToken(token: string): string {
-    return createHash('sha256').update(token).digest('hex');
+  async setupPassword(
+    input: PasswordSetupInput,
+  ): Promise<PasswordActionResponseDto> {
+    const user = await this.findPasswordUser(input);
+
+    if (user.passwordHash) {
+      throw new BadRequestException('Password is already set');
+    }
+
+    assertStrongPassword(input.password, user);
+    await this.assertPasswordNotReused(user.id, input.password);
+
+    const passwordHash = await bcrypt.hash(
+      input.password,
+      this.getPasswordHashRounds(),
+    );
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: user.id },
+        data: { passwordHash },
+      });
+      await tx.passwordHistory.create({
+        data: {
+          userId: user.id,
+          passwordHash,
+        },
+      });
+      await this.prunePasswordHistory(tx, user.id);
+    });
+
+    return { success: true, message: 'Password set successfully' };
   }
 
-  private generateConfirmationToken(): string {
-    // Keep it reasonably long so it matches ConfirmEmailDto @MinLength(16)
-    return randomBytes(24).toString('hex');
+  async changePassword(
+    input: PasswordChangeInput,
+  ): Promise<PasswordActionResponseDto> {
+    const user = await this.findPasswordUser(input);
+
+    if (!user.passwordHash) {
+      throw new BadRequestException('Password is not set');
+    }
+
+    const currentPasswordValid = await bcrypt.compare(
+      input.currentPassword,
+      user.passwordHash,
+    );
+
+    if (!currentPasswordValid) {
+      throw new UnauthorizedException('Invalid current password');
+    }
+
+    assertStrongPassword(input.newPassword, user);
+    await this.assertPasswordNotReused(user.id, input.newPassword);
+
+    const passwordHash = await bcrypt.hash(
+      input.newPassword,
+      this.getPasswordHashRounds(),
+    );
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: user.id },
+        data: { passwordHash },
+      });
+      await tx.passwordHistory.create({
+        data: {
+          userId: user.id,
+          passwordHash,
+        },
+      });
+      await this.prunePasswordHistory(tx, user.id);
+    });
+
+    return { success: true, message: 'Password changed successfully' };
   }
 
   /**
@@ -345,6 +459,7 @@ export class UsersService {
       throw new BadRequestException('Email already in use');
     }
 
+    const passwordHash = await bcrypt.hash(password, 10);
     const existingWallet = await this.prisma.user.findUnique({
       where: { walletAddress },
     });
@@ -352,7 +467,12 @@ export class UsersService {
       throw new BadRequestException('Wallet address already in use');
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordContext = { email, walletAddress };
+    assertStrongPassword(password, passwordContext);
+    const passwordHash = await bcrypt.hash(
+      password,
+      this.getPasswordHashRounds(),
+    );
 
     const user = await this.prisma.user.create({
       data: {
@@ -360,15 +480,23 @@ export class UsersService {
         email,
         passwordHash,
         role: 'USER',
-        verifiedStatus: false,
+      },
+    });
+
+    await this.prisma.passwordHistory.create({
+      data: {
+        userId: user.id,
+        passwordHash,
       },
     });
 
     const token = this.generateConfirmationToken();
     const tokenHash = this.hashToken(token);
 
-    // 24h default
-    const expiresHours = this.config.get<number>('EMAIL_TOKEN_EXPIRES_HOURS', 24);
+    const expiresHours = this.config.get<number>(
+      'EMAIL_TOKEN_EXPIRES_HOURS',
+      24,
+    );
     const expiresAt = new Date(Date.now() + expiresHours * 60 * 60 * 1000);
 
     await this.prisma.emailVerificationToken.create({
@@ -379,8 +507,6 @@ export class UsersService {
       },
     });
 
-    // Email sending not implemented in this repo yet.
-    // For now, we return a message (and token could be logged by caller in dev).
     return {
       message: 'Registration successful. Please confirm your email.',
     };
@@ -420,7 +546,7 @@ export class UsersService {
       }),
       this.prisma.user.update({
         where: { id: verification.userId },
-        data: { verifiedStatus: true },
+        data: { emailVerifiedAt: new Date() },
       }),
     ]);
 
@@ -430,16 +556,15 @@ export class UsersService {
   /**
    * Get or create user by wallet address
    */
-  async getOrCreateUser(walletAddress: string, email?: string) {
-    let user = await this.prisma.user.findUnique({
-      where: { walletAddress },
+  async getOrCreateUser(email: string) {
+    let user = await this.prisma.user.findFirst({
+      where: { email, deletedAt: null },
     });
 
     if (!user) {
       user = await this.prisma.user.create({
         data: {
-          walletAddress,
-          email: email || `${walletAddress}@stellaraid.local`,
+          email,
           role: 'DONOR',
         },
       });
@@ -450,7 +575,7 @@ export class UsersService {
           action: 'USER_CREATED',
           resourceType: 'User',
           resourceId: user.id,
-          details: JSON.stringify({ walletAddress }),
+          details: JSON.stringify({ email }),
         },
       });
     }
@@ -466,21 +591,19 @@ export class UsersService {
     role: UserRole,
     adminId: string,
   ): Promise<{ success: boolean; message: string }> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
+    const user = await this.prisma.user.findFirst({
+      where: { id: userId, deletedAt: null },
     });
 
     if (!user) {
       throw new NotFoundException('User not found');
     }
 
-    // Update role
     await this.prisma.user.update({
       where: { id: userId },
       data: { role },
     });
 
-    // Log to AuditLog
     await this.prisma.auditLog.create({
       data: {
         userId: adminId,
@@ -500,5 +623,100 @@ export class UsersService {
       message: `User role updated to ${role}`,
     };
   }
-}
 
+  private hashToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
+  }
+
+  private generateConfirmationToken(): string {
+    return randomBytes(24).toString('hex');
+  }
+
+  private async findPasswordUser(input: {
+    userId?: string;
+    walletAddress?: string;
+  }): Promise<PasswordUser> {
+    const userFilters = [
+      ...(input.userId ? [{ id: input.userId }] : []),
+      ...(input.walletAddress ? [{ walletAddress: input.walletAddress }] : []),
+    ];
+
+    if (userFilters.length === 0) {
+      throw new UnauthorizedException('Invalid token');
+    }
+
+    const user = await this.prisma.user.findFirst({
+      where: {
+        OR: userFilters,
+      },
+      select: {
+        id: true,
+        walletAddress: true,
+        email: true,
+        displayName: true,
+        name: true,
+        passwordHash: true,
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    return user;
+  }
+
+  private async assertPasswordNotReused(
+    userId: string,
+    password: string,
+  ): Promise<void> {
+    const history = await this.prisma.passwordHistory.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: PASSWORD_HISTORY_LIMIT,
+      select: { passwordHash: true },
+    });
+
+    for (const item of history) {
+      if (await bcrypt.compare(password, item.passwordHash)) {
+        throw new BadRequestException(
+          'Password was recently used. Choose a different password',
+        );
+      }
+    }
+  }
+
+  private async prunePasswordHistory(
+    tx: Pick<PrismaService, 'passwordHistory'>,
+    userId: string,
+  ): Promise<void> {
+    const history = await tx.passwordHistory.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      skip: PASSWORD_HISTORY_LIMIT,
+      select: { id: true },
+    });
+
+    if (history.length === 0) {
+      return;
+    }
+
+    await tx.passwordHistory.deleteMany({
+      where: {
+        id: { in: history.map((item) => item.id) },
+      },
+    });
+  }
+
+  private getPasswordHashRounds(): number {
+    const configuredRounds = this.config.get<number | string>(
+      'PASSWORD_BCRYPT_ROUNDS',
+      12,
+    );
+    const parsedRounds = Number(configuredRounds);
+
+    return Number.isInteger(parsedRounds) && parsedRounds > 0
+      ? parsedRounds
+      : 12;
+  }
+}

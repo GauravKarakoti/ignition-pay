@@ -6,6 +6,7 @@ import { SessionModule } from '../session/session.module';
 import { AuthChallengeController } from './auth-challenge.controller';
 import { AuthVerifyController } from './auth-verify.controller';
 import { AuthLogoutController } from './auth-logout.controller';
+import { JwtMiddleware } from './jwt.middleware';
 
 @Module({
   imports: [
@@ -21,6 +22,7 @@ import { AuthLogoutController } from './auth-logout.controller';
     SessionModule,
   ],
   controllers: [AuthChallengeController, AuthVerifyController, AuthLogoutController],
-  exports: [JwtModule],
+  providers: [JwtMiddleware],
+  exports: [JwtModule, JwtMiddleware],
 })
 export class AuthModule {}
