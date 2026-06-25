@@ -14,6 +14,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { LoginResponseDto } from './dto/login.dto';
 import { PasswordActionResponseDto } from './dto/password.dto';
 import { RegisterResponseDto } from './dto/register-response.dto';
+import { SessionService } from '../session/session.service';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UserProfileDto, PublicUserProfileDto } from './dto/user-profile.dto';
 import { assertStrongPassword } from './password-policy';
@@ -54,6 +55,7 @@ export class UsersService {
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
+    private readonly sessionService: SessionService,
   ) {}
 
   /**
@@ -326,21 +328,39 @@ export class UsersService {
       data: { loginAttempts: 0, lockedUntil: null },
     });
 
-    const payload = { sub: user.id, email: user.email, role: user.role };
-
-    const accessToken = this.jwt.sign(payload, {
-      secret: this.config.get<string>('JWT_SECRET', 'default-secret'),
-      expiresIn: '15m',
+    // Create a tracked session in Redis
+    const session = await this.sessionService.createSession({
+      userId: user.id,
+      walletAddress: user.walletAddress,
+      role: user.role,
     });
 
+    const accessTtlSeconds = this.config.get<number>('SESSION_ACCESS_TTL_SECONDS', 900);
+
+    const accessToken = this.jwt.sign(
+      {
+        sub: user.id,
+        walletAddress: user.walletAddress,
+        email: user.email,
+        role: user.role,
+        sid: session.sessionId,
+      },
+      {
+        secret: this.config.get<string>('JWT_SECRET', 'default-secret'),
+        expiresIn: `${accessTtlSeconds}s`,
+      },
+    );
+
+    const sessionTtlSeconds = this.config.get<number>('SESSION_TTL_SECONDS', 604800);
+
     const refreshToken = this.jwt.sign(
-      { sub: user.id },
+      { sub: user.id, sid: session.sessionId },
       {
         secret: this.config.get<string>(
           'REFRESH_TOKEN_SECRET',
           'default-refresh-secret',
         ),
-        expiresIn: '7d',
+        expiresIn: `${sessionTtlSeconds}s`,
       },
     );
 
